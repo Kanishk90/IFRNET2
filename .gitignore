@@ -1,5 +1,9 @@
 /checkpoints
+/checkpoints_new
 /data
 /mlruns
 mlflow.db
+/__pycache__
+*.log
+*.csv
 

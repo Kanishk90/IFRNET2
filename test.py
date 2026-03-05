@@ -1,18 +1,24 @@
-import torch
-import nibabel as nib
+import os
+import time
+import logging
+import argparse
 import numpy as np
+import torch
+from tqdm import tqdm
 from model import Model
 
 
-def normalize(vol):
-    vmin, vmax = vol.min(), vol.max()
-    if vmax - vmin < 1e-8:
-        return np.zeros_like(vol)
-    return (vol - vmin) / (vmax - vmin)
+# ---------------------- Logging ---------------------- #
+def setup_logger():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s"
+    )
+    return logging.getLogger(__name__)
 
 
+# ---------------------- Pad ---------------------- #
 def pad_to_multiple(t, base=16):
-    """Pad tensor (1, C, H, W) so H and W are multiples of base."""
     _, _, H, W = t.shape
     pad_h = (base - H % base) % base
     pad_w = (base - W % base) % base
@@ -22,56 +28,68 @@ def pad_to_multiple(t, base=16):
     return t, H, W
 
 
-def interp_volume(vol, model, device="cuda"):
-    H, W, D = vol.shape
-    out = np.zeros((H, W, 2 * D - 1), dtype=np.float32)
-    out[:, :, 0::2] = vol
+# ---------------------- Inference ---------------------- #
+def infer_pair(img0, img1, model, device):
+    t0 = torch.from_numpy(img0).float().unsqueeze(0).unsqueeze(0).repeat(1,3,1,1).to(device)
+    t1 = torch.from_numpy(img1).float().unsqueeze(0).unsqueeze(0).repeat(1,3,1,1).to(device)
+    embt = torch.tensor([0.5], dtype=torch.float32).view(1,1,1,1).to(device)
 
-    model.eval()
+    t0, orig_H, orig_W = pad_to_multiple(t0)
+    t1, _, _ = pad_to_multiple(t1)
 
     with torch.no_grad():
-        for k in range(D - 1):
-            s0 = vol[:, :, k]
-            s1 = vol[:, :, k + 1]
+        pred = model.inference(t0, t1, embt)
 
-            t0 = torch.from_numpy(s0).float().unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1).to(device)
-            t1 = torch.from_numpy(s1).float().unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1).to(device)
-            embt = torch.tensor([0.5], dtype=torch.float32).view(1, 1, 1, 1).to(device)
-
-            # Pad to 16-multiple for encoder compatibility
-            t0, orig_H, orig_W = pad_to_multiple(t0)
-            t1, _, _ = pad_to_multiple(t1)
-
-            pred = model.inference(t0, t1, embt)
-            # Crop back to original size
-            pred = pred[:, :, :orig_H, :orig_W]
-            pred = pred[0, 0].cpu().numpy()
-
-            out[:, :, 2 * k + 1] = pred
-
-    return out
+    pred = pred[:, :, :orig_H, :orig_W]
+    return pred[0, 0].cpu().numpy()
 
 
-def run(input_nii, model_path, output_nii):
+# ---------------------- Run ---------------------- #
+def run(input_path, model_path, output_dir):
+    logger = setup_logger()
+    os.makedirs(output_dir, exist_ok=True)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    nii = nib.load(input_nii)
-    vol = nii.get_fdata()
-    vol = normalize(vol).astype(np.float32)
+    logger.info(f"Using device: {device}")
 
     model = Model().to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    logger.info("Model loaded.")
 
-    out = interp_volume(vol, model, device)
+    if os.path.isdir(input_path):
+        files = sorted([f for f in os.listdir(input_path) if f.endswith(".npz")])
+        logger.info(f"Found {len(files)} NPZ files.")
+    else:
+        files = [os.path.basename(input_path)]
+        input_path = os.path.dirname(input_path)
 
-    out_nii = nib.Nifti1Image(out, nii.affine)
-    nib.save(out_nii, output_nii)
-    print(f"Saved interpolated volume: {output_nii} (shape {out.shape})")
+    start = time.time()
+
+    for fname in tqdm(files, desc="Testing"):
+        data = np.load(os.path.join(input_path, fname))
+        img0 = data["img0"]
+        img1 = data["img1"]
+
+        pred = infer_pair(img0, img1, model, device)
+
+        # out_path = os.path.join(output_dir, fname.replace(".npz", "_pred.npy"))
+        # np.save(out_path, pred)
+
+        from PIL import Image
+
+        # Normalize to 0-255 for PNG
+        pred_norm = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
+        pred_uint8 = (pred_norm * 255).astype(np.uint8)
+
+        out_path = os.path.join(output_dir, fname.replace(".npz", "_pred.png"))
+        Image.fromarray(pred_uint8).save(out_path)
+
+    logger.info(f"Done. Total time: {time.time()-start:.2f}s")
 
 
+# ---------------------- Main ---------------------- #
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--model", required=True)
