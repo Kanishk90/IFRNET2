@@ -1,9 +1,10 @@
 /checkpoints
 /checkpoints_new
-/data
+/atlas_t1
 /mlruns
 mlflow.db
 /__pycache__
 *.log
 *.csv
-
+/mixed16x8_random_128
+/checkpoints_mixed16x8_random_128

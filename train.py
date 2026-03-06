@@ -4,6 +4,7 @@ import time
 import socket
 import logging
 from pathlib import Path
+import argparse
 
 import torch
 import torch.nn.functional as F
@@ -16,26 +17,26 @@ import mlflow
 
 
 # ---------------------------------------------------------
-# CUDA optimization
+# CUDA Optimization
 # ---------------------------------------------------------
 torch.backends.cudnn.benchmark = True
 
 
 # ---------------------------------------------------------
-# PSNR Metric
+# PSNR
 # ---------------------------------------------------------
 @torch.no_grad()
 def compute_psnr(pred, target, data_range=1.0):
 
-    mse = ((pred - target) ** 2).mean(dim=[1, 2, 3])
+    mse = ((pred - target) ** 2).mean(dim=[1,2,3])
 
-    psnr = 10 * torch.log10(data_range ** 2 / (mse + 1e-8))
+    psnr = 10 * torch.log10(data_range**2 / (mse + 1e-8))
 
     return psnr.mean().item()
 
 
 # ---------------------------------------------------------
-# SSIM Metric
+# SSIM
 # ---------------------------------------------------------
 @torch.no_grad()
 def compute_ssim(pred, target, data_range=1.0, window_size=11):
@@ -75,7 +76,7 @@ def setup_logger(save_dir):
 
     log_file = os.path.join(save_dir, "train.log")
 
-    logger = logging.getLogger("ifrnet_train")
+    logger = logging.getLogger("train_logger")
     logger.setLevel(logging.INFO)
 
     if logger.hasHandlers():
@@ -104,7 +105,6 @@ def setup_mlflow(experiment_name, run_name, params, out_dir, logger,
     try:
         sock = socket.create_connection(("localhost",10226),timeout=2)
         sock.close()
-
         tracking_uri = server_uri
         logger.info("MLflow server reachable")
 
@@ -123,7 +123,7 @@ def setup_mlflow(experiment_name, run_name, params, out_dir, logger,
 
 
 # ---------------------------------------------------------
-# Training Function
+# Training
 # ---------------------------------------------------------
 def train(args):
 
@@ -133,13 +133,32 @@ def train(args):
 
     logger.info(f"Using device: {device}")
 
+
+    # -----------------------------------------------------
+    # Dynamic Run Name
+    # -----------------------------------------------------
+
+    train_name = Path(args.train).name
+    val_name = Path(args.val).name
+
+    run_name = (
+        f"{args.dataset_name}_"
+        f"{train_name}_"
+        f"{val_name}_"
+        f"ep{args.epochs}_"
+        f"bs{args.batch_size}_"
+        f"lr{args.lr}"
+    )
+
+
     setup_mlflow(
         args.experiment,
-        f"run_bs{args.batch_size}_lr{args.lr}",
+        run_name,
         vars(args),
         args.out,
         logger
     )
+
 
     # -----------------------------------------------------
     # Dataset
@@ -176,7 +195,11 @@ def train(args):
 
     model = Model().to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
 
     scaler = torch.cuda.amp.GradScaler()
 
@@ -184,7 +207,7 @@ def train(args):
 
 
     # -----------------------------------------------------
-    # Metrics CSV
+    # CSV Metrics
     # -----------------------------------------------------
 
     metrics_path = os.path.join(args.out,"metrics.csv")
@@ -231,9 +254,7 @@ def train(args):
                 loss = loss_rec + loss_geo + loss_dis
 
             scaler.scale(loss).backward()
-
             scaler.step(optimizer)
-
             scaler.update()
 
             train_loss += loss.item()
@@ -269,7 +290,6 @@ def train(args):
                 val_loss += loss.item()
 
                 val_psnr += compute_psnr(pred,imgt)
-
                 val_ssim += compute_ssim(pred,imgt)
 
         val_loss /= len(val_loader)
@@ -278,10 +298,6 @@ def train(args):
 
         epoch_time = time.time() - epoch_start
 
-
-        # -------------------------------------------------
-        # Logging
-        # -------------------------------------------------
 
         logger.info(
             f"Epoch {epoch} | "
@@ -293,7 +309,7 @@ def train(args):
         )
 
 
-        # CSV Logging
+        # CSV logging
         with open(metrics_path,"a",newline="") as f:
 
             writer = csv.writer(f)
@@ -308,7 +324,7 @@ def train(args):
             ])
 
 
-        # MLflow Logging
+        # MLflow logging
         mlflow.log_metric("train_loss",train_loss,step=epoch)
         mlflow.log_metric("val_loss",val_loss,step=epoch)
         mlflow.log_metric("val_psnr",val_psnr,step=epoch)
@@ -316,10 +332,7 @@ def train(args):
         mlflow.log_metric("epoch_time",epoch_time,step=epoch)
 
 
-        # -------------------------------------------------
-        # Save Best Model
-        # -------------------------------------------------
-
+        # Save best model
         if val_loss < best_val_loss:
 
             best_val_loss = val_loss
@@ -331,13 +344,9 @@ def train(args):
             logger.info(f"New best model saved at epoch {epoch}")
 
             mlflow.log_artifact(best_path)
-            mlflow.log_metric("best_val_loss",best_val_loss,step=epoch)
 
 
-        # -------------------------------------------------
-        # Save Epoch Checkpoint
-        # -------------------------------------------------
-
+        # Save checkpoint
         ckpt_path = os.path.join(args.out,f"model_{epoch:03d}.pth")
 
         torch.save(model.state_dict(),ckpt_path)
@@ -347,25 +356,25 @@ def train(args):
 
 
 # ---------------------------------------------------------
-# Entry Point
+# Entry
 # ---------------------------------------------------------
-
 if __name__ == "__main__":
-
-    import argparse
 
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--train",required=True)
     parser.add_argument("--val",required=True)
 
-    parser.add_argument("--out",default="checkpoints_new")
+    parser.add_argument("--out",default="checkpoints_mixed16x8_random_128")
 
     parser.add_argument("--epochs",type=int,default=100)
     parser.add_argument("--batch_size",type=int,default=8)
     parser.add_argument("--lr",type=float,default=1e-4)
+    parser.add_argument("--weight_decay",type=float,default=5e-4)
 
-    parser.add_argument("--experiment",default="MRI_ThroughPlane_S")
+    parser.add_argument("--experiment",default="IFRNet2")
+
+    parser.add_argument("--dataset_name",default="mri_dataset")
 
     args = parser.parse_args()
 
